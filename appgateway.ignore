@@ -1,0 +1,147 @@
+resource "azurerm_public_ip" "agw_pip" {
+  name                = "pip-${var.appname}-${var.environment}-${azurerm_resource_group.rg.location}"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  sku                 = "Standard"
+  allocation_method   = "Static"
+}
+
+
+
+locals {
+  backend_address_pool_name      = "${var.appname}-agw-beap"
+  frontend_port_name             = "${var.appname}-agw-feport"
+  frontend_ip_configuration_name = "${var.appname}-agw-feip"
+  http_setting_name              = "${var.appname}-agw-be-htst"
+  ssl_cert                       = "${var.appname}-agw-sslcert"
+  listener_name                  = "${var.appname}-agw-httplstn"
+  request_routing_rule_name      = "${var.appname}-agw-rqrt"
+  redirect_configuration_name    = "${var.appname}-agw-rdrcfg"
+  probe_name                     = "${var.appname}-agw-probe"
+
+  # backend_address_pool_oai_fqdns = 
+  oai_fqdns = [for oai in var.openai.regions :
+    "oai-${var.appname}-${var.environment}-${oai.location}-${oai.name}.openai.azure.com"
+  ]
+
+  agw_private_ip = cidrhost(data.azurerm_subnet.agw_subnet.address_prefixes[0], 10)
+}
+
+resource "azurerm_application_gateway" "agw" {
+  name                = "agw-${var.appname}-${var.environment}-${azurerm_resource_group.rg.location}"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+
+  sku {
+    name     = var.application_gateway.sku_name
+    tier     = var.application_gateway.sku_name
+    capacity = var.application_gateway.capacity
+  }
+
+  gateway_ip_configuration {
+    name      = "my-gateway-ip-configuration"
+    subnet_id = data.azurerm_subnet.agw_subnet.id
+  }
+
+  frontend_port {
+    name = local.frontend_port_name
+    port = 80
+  }
+
+  frontend_port {
+    name = "${local.frontend_port_name}-443"
+    port = 443
+  }
+
+  frontend_ip_configuration {
+    name                 = local.frontend_ip_configuration_name
+    public_ip_address_id = azurerm_public_ip.agw_pip.id
+  }
+
+  frontend_ip_configuration {
+    name                          = "${local.frontend_ip_configuration_name}-private"
+    private_ip_address_allocation = "Static"
+    private_ip_address            = local.agw_private_ip
+    subnet_id                     = data.azurerm_subnet.agw_subnet.id
+  }
+
+  backend_address_pool {
+    name  = local.backend_address_pool_name
+    fqdns = local.oai_fqdns
+  }
+
+  backend_http_settings {
+    name                                = local.http_setting_name
+    cookie_based_affinity               = "Disabled"
+    path                                = ""
+    port                                = 443
+    protocol                            = "Https"
+    request_timeout                     = 60
+    probe_name                          = local.probe_name
+    pick_host_name_from_backend_address = true
+  }
+
+  probe {
+    path                                      = "/status-0123456789abcdef"
+    name                                      = local.probe_name
+    protocol                                  = "Https"
+    pick_host_name_from_backend_http_settings = true
+    interval                                  = 30
+    timeout                                   = 30
+    unhealthy_threshold                       = 3
+  }
+
+  http_listener {
+    name                           = local.listener_name
+    frontend_ip_configuration_name = "${local.frontend_ip_configuration_name}-private"
+    frontend_port_name             = local.frontend_port_name
+    protocol                       = "Http"
+  }
+
+  identity {
+    type         = "UserAssigned"
+    identity_ids = [data.azurerm_user_assigned_identity.agw_identity.id]
+  }
+
+  http_listener {
+    name                           = "${local.listener_name}-443"
+    frontend_ip_configuration_name = "${local.frontend_ip_configuration_name}-private"
+    frontend_port_name             = "${local.frontend_port_name}-443"
+    protocol                       = "Https"
+    host_name                      = var.application_gateway.certificate_import.host_name
+    ssl_certificate_name           = local.ssl_cert
+
+  }
+
+  ssl_certificate {
+    name                = local.ssl_cert
+    key_vault_secret_id = data.azurerm_key_vault_certificate.cert.secret_id
+  }
+
+  request_routing_rule {
+    name                       = local.request_routing_rule_name
+    priority                   = 9
+    rule_type                  = "Basic"
+    http_listener_name         = "${local.listener_name}-443"
+    backend_address_pool_name  = local.backend_address_pool_name
+    backend_http_settings_name = local.http_setting_name
+  }
+  
+}
+
+
+
+resource "azurerm_private_dns_a_record" "agw_env_at_record" {
+  name                = "@"
+  zone_name           = azurerm_private_dns_zone.agw_dns_zone.name
+  resource_group_name = azurerm_resource_group.rg.name
+  ttl                 = 300
+  records             = [local.agw_private_ip]
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "dns_vnet_lnk_agw" {
+  name                  = "dns_lnk_agw"
+  resource_group_name   = azurerm_resource_group.rg.name
+  private_dns_zone_name = azurerm_private_dns_zone.agw_dns_zone.name
+  virtual_network_id    = azurerm_virtual_network.vnet.id
+}
